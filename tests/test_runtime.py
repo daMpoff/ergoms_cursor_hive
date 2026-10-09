@@ -13,7 +13,7 @@ from unittest.mock import patch
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from cursor_hive_runtime.adapters import cursor_argv, parse_stream
+from cursor_hive_runtime.adapters import configure_worker, cursor_argv, parse_stream
 from cursor_hive_runtime.board import Board
 from cursor_hive_runtime.cli import wait
 from cursor_hive_runtime.controller import control, recover, start_run, status
@@ -23,6 +23,7 @@ from cursor_hive_runtime.processes import OwnedProcess, alive, identity
 from cursor_hive_runtime.rpc import Client, RuntimeAPI, start_server
 from cursor_hive_runtime.supervisor import Supervisor, should_wake
 from cursor_hive_runtime.util import atomic_json, read_json
+from cursor_hive_runtime.workspace import capture, prepare
 
 
 class RuntimeTests(unittest.TestCase):
@@ -58,6 +59,15 @@ class RuntimeTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertFalse(alive(record), "Supervisor must exit before removing retained files")
 
+    def diagnostic(self, value):
+        run = self.home / "runs" / value["run_id"]
+        return {
+            "error": value.get("error"),
+            "logs": {
+                p.name: p.read_text(errors="replace")[-4000:] for p in run.glob("*.stderr.log")
+            },
+        }
+
     def test_full_two_process_demo_exports_peer_result_without_source_edits(self):
         result = start_run(
             self.project, "demo", home=self.home, operation_id="fixed", backend="fake"
@@ -69,7 +79,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(run_id, repeated["run_id"])
         end = wait(self.home, run_id, 45)
         self.wait_for_exit(run_id)
-        self.assertEqual(end["state"], "exported", end.get("error"))
+        self.assertEqual(end["state"], "exported", self.diagnostic(end))
         report = read_json(self.home / "runs" / run_id / "report.json")
         self.assertEqual(report["turns"], {"a": 1, "b": 1})
         exported = Path(report["export"]) / "files/hive-demo-b.txt"
@@ -98,7 +108,7 @@ class RuntimeTests(unittest.TestCase):
         )
         end = wait(self.home, result["run_id"], 45)
         self.wait_for_exit(result["run_id"])
-        self.assertEqual(end["state"], "exported", end.get("error"))
+        self.assertEqual(end["state"], "exported", self.diagnostic(end))
         self.assertTrue(end["report"]["checks"]["observed"])
         self.assertTrue(end["report"]["checks"]["passed"])
         self.assertFalse(end["report"]["ready"])
@@ -112,6 +122,47 @@ class RuntimeTests(unittest.TestCase):
     def test_missing_pid_is_not_reported_alive(self):
         self.assertIsNone(identity(2**30))
         self.assertFalse(alive({"pid": 2**30, "created": None}))
+
+    def test_fake_peer_started_before_dependency_is_complete(self):
+        run = self.root / "early-peer"
+        run.mkdir()
+        atomic_json(run / "config.json", {"permissions": {"allow": [], "deny": []}})
+        prepare(run, capture(self.project, run))
+        board = Board(run / "state.sqlite")
+        board.initialize("early", self.project, "demo")
+        board.set_meta("state", "running")
+        api = RuntimeAPI(board, run, "controller")
+        api.bind("b", "early-b")
+        server, url = start_server(api)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        def mutate(method, **args):
+            return api.dispatch("a", method, {"revision": 1, **args}, str(uuid.uuid4()))
+
+        mutate("ack")
+        task = mutate("task_create", description="A dependency")
+        claim = mutate("task_claim", task_id=task["task_id"])
+        mutate("task_create", description="B reuses A", dependencies=[task["task_id"]])
+        child = OwnedProcess(
+            [sys.executable, "-m", "cursor_hive_runtime.fake_agent"],
+            cwd=run / "workers/b",
+            env=configure_worker(run, "b", url, "early-b"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(child.stop)
+        deadline = time.monotonic() + 15
+        while board.meta("ack:b") != 1 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(board.meta("ack:b"), 1)
+        time.sleep(0.2)
+        self.assertIsNone(child.child.poll(), "B must wait for its unfinished dependency")
+        (run / "workers/a/hive-demo-a.txt").write_text("Dependency A\n", encoding="utf-8")
+        publication = mutate("publish", kind="fact", message="A done", paths=["hive-demo-a.txt"])
+        mutate("task_complete", **claim, **publication)
+        self.assertEqual(child.child.wait(timeout=15), 0)
+        self.assertIsNotNone(board.meta("candidate"))
 
     def test_worker_principal_cannot_stop_or_impersonate_controller(self):
         self.home.mkdir()

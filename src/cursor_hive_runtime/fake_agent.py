@@ -1,6 +1,7 @@
 """Deterministic demonstration; never executes the user's coding request."""
 
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -31,8 +32,17 @@ def main():
         mutate("task_complete", **{k: claim[k] for k in ("task_id", "claim_version")}, **pub)
         mutate("yield")
     else:
-        context = client.call("context")
-        first_task = next(t for t in context["tasks"] if t["state"] == "completed")
+        # The first available task can wake B before A has claimed or completed it.
+        # This bounded polling belongs only to the deterministic transport demo.
+        deadline = time.monotonic() + 30
+        while True:
+            context = client.call("context")
+            first_task = next((t for t in context["tasks"] if t["state"] == "completed"), None)
+            if first_task:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Demo A did not publish the required dependency")
+            time.sleep(0.05)
         mutate("import", publication_id=first_task["publication_id"])
         claim = mutate("task_claim")
         if not claim["task_id"]:
