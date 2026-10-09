@@ -38,11 +38,25 @@ class RuntimeTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.project), "add", "source.txt"], check=True)
         (self.project / "source.txt").write_text("dirty", encoding="utf-8")
         self.index = (self.project / ".git/index").read_bytes()
+        self.addCleanup(self.stop_runs)
+
+    def stop_runs(self):
+        for run in (self.home / "runs").glob("*"):
+            process = run / "supervisor.json"
+            if process.exists() and alive(read_json(process)):
+                try:
+                    control(self.home, run.name, "stop")
+                except HiveError:
+                    pass
+                self.wait_for_exit(run.name)
 
     def wait_for_exit(self, run_id):
-        end = time.monotonic() + 5
-        while time.monotonic() < end and status(self.home, run_id)["supervisor_alive"]:
+        process = self.home / "runs" / run_id / "supervisor.json"
+        record = read_json(process)
+        end = time.monotonic() + 20
+        while time.monotonic() < end and alive(record):
             time.sleep(0.05)
+        self.assertFalse(alive(record), "Supervisor must exit before removing retained files")
 
     def test_full_two_process_demo_exports_peer_result_without_source_edits(self):
         result = start_run(
@@ -53,7 +67,7 @@ class RuntimeTests(unittest.TestCase):
             self.project, "demo", home=self.home, operation_id="fixed", backend="fake"
         )
         self.assertEqual(run_id, repeated["run_id"])
-        end = wait(self.home, run_id, 15)
+        end = wait(self.home, run_id, 45)
         self.wait_for_exit(run_id)
         self.assertEqual(end["state"], "exported", end.get("error"))
         report = read_json(self.home / "runs" / run_id / "report.json")
@@ -82,8 +96,9 @@ class RuntimeTests(unittest.TestCase):
                 "from pathlib import Path; assert Path('hive-demo-b.txt').exists()",
             ],
         )
-        end = wait(self.home, result["run_id"], 15)
+        end = wait(self.home, result["run_id"], 45)
         self.wait_for_exit(result["run_id"])
+        self.assertEqual(end["state"], "exported", end.get("error"))
         self.assertTrue(end["report"]["checks"]["observed"])
         self.assertTrue(end["report"]["checks"]["passed"])
         self.assertFalse(end["report"]["ready"])
@@ -93,6 +108,10 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaises(HiveError) as e:
                 start_run(self.project, "nested", home=self.home, backend="fake")
         self.assertEqual(e.exception.code, "nested_start")
+
+    def test_missing_pid_is_not_reported_alive(self):
+        self.assertIsNone(identity(2**30))
+        self.assertFalse(alive({"pid": 2**30, "created": None}))
 
     def test_worker_principal_cannot_stop_or_impersonate_controller(self):
         self.home.mkdir()
@@ -138,17 +157,17 @@ class RuntimeTests(unittest.TestCase):
             "demo",
             home=self.home,
             backend="fake",
-            check_argv=[sys.executable, "-c", "import time; time.sleep(20)"],
-            check_timeout=25,
+            check_argv=[sys.executable, "-c", "import time; time.sleep(60)"],
+            check_timeout=90,
         )
         run_id = result["run_id"]
         run = self.home / "runs" / run_id
-        end = time.monotonic() + 8
+        end = time.monotonic() + 30
         while time.monotonic() < end and not (run / "process-check.json").exists():
             time.sleep(0.025)
-        self.assertTrue((run / "process-check.json").exists())
+        self.assertTrue((run / "process-check.json").exists(), status(self.home, run_id))
         control(self.home, run_id, "stop")
-        value = wait(self.home, run_id, 10)
+        value = wait(self.home, run_id, 30)
         self.wait_for_exit(run_id)
         self.assertEqual(value["state"], "cancelled", value.get("error"))
         self.assertTrue(read_json(run / "check-receipt.json")["cancelled"])

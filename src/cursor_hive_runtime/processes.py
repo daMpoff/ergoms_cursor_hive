@@ -20,7 +20,7 @@ def identity(pid):
         return {"pid": pid, "created": p.create_time()}
     except ProcessLookupError:
         return None
-    except psutil.Error:
+    except psutil.Error as error:
         # Some containers cannot inspect /proc for every real child. Unknown creation
         # time is never authorization to kill a saved PID. A live Popen handle is.
         if os.name != "nt":
@@ -29,6 +29,8 @@ def identity(pid):
                 return {"pid": pid, "created": None}
             except ProcessLookupError:
                 return None
+        if isinstance(error, psutil.NoSuchProcess):
+            return None
         return {"pid": pid, "created": None}
 
 
