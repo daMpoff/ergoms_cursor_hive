@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cursor-hive": {
+      "command": "python",
+      "args": ["${CURSOR_PLUGIN_ROOT}/bin/launcher.py"]
+    }
+  }
+}

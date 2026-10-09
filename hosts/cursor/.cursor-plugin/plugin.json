@@ -1,0 +1,11 @@
+{
+  "name": "cursor-hive",
+  "version": "0.1.0",
+  "description": "Two Cursor workers with a local shared board and export-only results",
+  "author": {"name": "CursorHive contributors"},
+  "repository": "https://github.com/daMpoff/ergoms_cursor_hive",
+  "license": "MIT",
+  "skills": "skills/",
+  "commands": "commands/",
+  "mcpServers": "mcp.json"
+}
